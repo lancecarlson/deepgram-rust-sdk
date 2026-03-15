@@ -44,6 +44,7 @@ use self::file_chunker::FileChunker;
 use crate::{
     common::{
         options::{Encoding, Endpointing, Options},
+        reconnect::ReconnectConfig,
         stream_response::StreamResponse,
     },
     Deepgram, DeepgramError, Result, Transcription,
@@ -66,6 +67,7 @@ pub struct WebsocketBuilder<'a> {
     stream_url: Url,
     keep_alive: Option<bool>,
     callback: Option<Url>,
+    reconnect: Option<ReconnectConfig>,
 }
 
 impl Transcription<'_> {
@@ -147,6 +149,7 @@ impl Transcription<'_> {
             stream_url: self.listen_stream_url(),
             keep_alive: None,
             callback: None,
+            reconnect: None,
         }
     }
 
@@ -219,6 +222,7 @@ impl WebsocketBuilder<'_> {
             vad_events,
             stream_url,
             callback,
+            reconnect: _,
         } = self;
 
         let mut url = stream_url.clone();
@@ -327,6 +331,16 @@ impl WebsocketBuilder<'_> {
     pub fn callback(mut self, callback: Url) -> Self {
         self.callback = Some(callback);
 
+        self
+    }
+
+    /// Enable automatic reconnection with the given configuration.
+    ///
+    /// When enabled, if the WebSocket connection drops unexpectedly,
+    /// the client will automatically attempt to reconnect with exponential backoff.
+    /// Messages sent during reconnection will be queued in the channel buffer.
+    pub fn reconnect(mut self, config: ReconnectConfig) -> Self {
+        self.reconnect = Some(config);
         self
     }
 }
@@ -450,6 +464,14 @@ impl WebsocketBuilder<'_> {
     }
 }
 
+/// Reason the inner worker loop exited.
+enum WorkerExit {
+    /// Normal close (user-initiated or server close with no error).
+    Closed,
+    /// Unexpected error (connection lost, etc.).
+    Error(DeepgramError),
+}
+
 macro_rules! send_message {
     ($stream:expr, $response_tx:expr, $msg:expr) => {
         if let Err(err) = $stream.send($msg).await {
@@ -460,26 +482,58 @@ macro_rules! send_message {
         }
     };
 }
-async fn run_worker(
+
+/// Connect to the WebSocket server and return the stream.
+async fn connect_websocket(
+    url: &Url,
+    auth: &Option<crate::AuthMethod>,
+) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
+    let host = url.host_str().ok_or(DeepgramError::InvalidUrl)?;
+
+    let request = {
+        let http_builder = Request::builder()
+            .method("GET")
+            .uri(url.to_string())
+            .header("sec-websocket-key", client::generate_key())
+            .header("host", host)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("user-agent", crate::USER_AGENT);
+
+        let builder = if let Some(auth) = auth {
+            http_builder.header("authorization", auth.header_value())
+        } else {
+            http_builder
+        };
+        builder.body(())?
+    };
+
+    let (ws_stream, _upgrade_response) = tokio_tungstenite::connect_async(request).await?;
+    Ok(ws_stream)
+}
+
+/// Inner worker loop that processes a single WebSocket connection.
+/// Returns a `WorkerExit` indicating whether the exit was clean or an error.
+async fn run_worker_inner(
     ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     mut message_tx: Sender<WsMessage>,
-    mut message_rx: Receiver<WsMessage>,
-    mut response_tx: Sender<Result<StreamResponse>>,
+    message_rx: &mut Receiver<WsMessage>,
+    response_tx: &mut Sender<Result<StreamResponse>>,
     keep_alive: bool,
-) -> Result<()> {
+) -> WorkerExit {
     // We use Vec<u8> for partial frames because we don't know if a fragment of a string is valid utf-8.
     let mut partial_frame: Vec<u8> = Vec::new();
     let (mut ws_stream_send, ws_stream_recv) = ws_stream.split();
     let mut ws_stream_recv = ws_stream_recv.fuse();
     let mut is_open: bool = true;
     let mut last_sent_message = tokio::time::Instant::now();
+    let mut user_closed = false;
     loop {
-        // eprintln!("<worker> loop");
         let sleep = tokio::time::sleep_until(last_sent_message + Duration::from_secs(3));
         // Primary event loop.
         select_biased! {
             _ = sleep.fuse() => {
-                // eprintln!("<worker> sleep");
                 if keep_alive && is_open {
                     message_tx.send(WsMessage::ControlMessage(ControlMessage::KeepAlive)).await.expect("we hold the receiver, so we know it hasn't been dropped");
                     last_sent_message = tokio::time::Instant::now();
@@ -490,7 +544,6 @@ async fn run_worker(
             response = ws_stream_recv.next() => {
                 match response {
                     Some(Ok(Message::Text(response))) => {
-                        // eprintln!("<worker> received dg response");
                         match serde_json::from_str(&response) {
                             Ok(response) => {
                                 if (response_tx.send(Ok(response)).await).is_err() {
@@ -511,13 +564,15 @@ async fn run_worker(
                         let _ = ws_stream_send.send(Message::Pong(value)).await;
                     }
                     Some(Ok(Message::Close(None))) => {
-                        // eprintln!("<worker> received websocket close");
-                        return Ok(());
+                        return WorkerExit::Closed;
                     }
                     Some(Ok(Message::Close(Some(closeframe)))) => {
-                        // eprintln!("<worker> received websocket close");
-                        return Err(DeepgramError::WebsocketClose {
-                            code: closeframe.code.into(),
+                        let code: u16 = closeframe.code.into();
+                        if code == 1000 {
+                            return WorkerExit::Closed;
+                        }
+                        return WorkerExit::Error(DeepgramError::WebsocketClose {
+                            code,
                             reason: closeframe.reason.to_string(),
                         });
                     }
@@ -554,21 +609,15 @@ async fn run_worker(
                     }
 
                     Some(Err(err)) => {
-                        if (response_tx.send(Err(err.into())).await).is_err() {
-                            // Responses are no longer being received; close the stream.
-                            break;
-                        }
-
+                        return WorkerExit::Error(err.into());
                     }
                     None => {
                         // Upstream is closed
-                        // eprintln!("<worker> received None");
-                        return Ok(())
+                        return WorkerExit::Closed;
                     }
                 }
             }
             message = message_rx.next() => {
-                // eprintln!("<worker> received message: {message:?}, {is_open:?}");
                 if is_open {
                     match message {
                         Some(WsMessage::Audio(audio))=> {
@@ -583,6 +632,7 @@ async fn run_worker(
                             last_sent_message = tokio::time::Instant::now();
                             if msg == ControlMessage::CloseStream {
                                 is_open = false;
+                                user_closed = true;
                             }
                         }
                         None => {
@@ -591,28 +641,86 @@ async fn run_worker(
                                 Utf8Bytes::from(serde_json::to_string(&ControlMessage::CloseStream).unwrap_or_default())
                             ));
                             is_open = false;
+                            user_closed = true;
                         }
                     }
                 }
             }
         };
     }
-    // eprintln!("<worker> post loop");
-    if let Err(err) = ws_stream_send
-        .send(Message::Text(Utf8Bytes::from(
-            serde_json::to_string(&ControlMessage::CloseStream).unwrap_or_default(),
-        )))
-        .await
-    {
-        // If the response channel is closed, there's nothing to be done about it now.
-        let _ = response_tx.send(Err(err.into())).await;
+    // If we broke out of the loop (response channel closed), treat it based on
+    // whether the user initiated the close.
+    if user_closed {
+        // Post-loop cleanup
+        if let Err(err) = ws_stream_send
+            .send(Message::Text(Utf8Bytes::from(
+                serde_json::to_string(&ControlMessage::CloseStream).unwrap_or_default(),
+            )))
+            .await
+        {
+            let _ = response_tx.send(Err(err.into())).await;
+        }
     }
+    WorkerExit::Closed
+}
+
+/// Run the worker with optional reconnection support.
+async fn run_worker(
+    url: Url,
+    auth: Option<crate::AuthMethod>,
+    reconnect_config: Option<ReconnectConfig>,
+    initial_ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    message_tx: Sender<WsMessage>,
+    mut message_rx: Receiver<WsMessage>,
+    mut response_tx: Sender<Result<StreamResponse>>,
+    keep_alive: bool,
+) -> Result<()> {
+    let mut attempt = 0u32;
+    let mut ws_stream = initial_ws_stream;
+
+    loop {
+        let exit_reason = run_worker_inner(
+            ws_stream,
+            message_tx.clone(),
+            &mut message_rx,
+            &mut response_tx,
+            keep_alive,
+        )
+        .await;
+
+        match exit_reason {
+            WorkerExit::Closed => break,
+            WorkerExit::Error(e) => {
+                if let Some(ref config) = reconnect_config {
+                    if config.should_retry(attempt) {
+                        let delay = config.delay_for_attempt(attempt);
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        match connect_websocket(&url, &auth).await {
+                            Ok(new_stream) => {
+                                ws_stream = new_stream;
+                                continue;
+                            }
+                            Err(connect_err) => {
+                                // Connection failed, report the error
+                                let _ = response_tx.send(Err(connect_err)).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // No reconnect configured or max retries reached
+                let _ = response_tx.send(Err(e)).await;
+                break;
+            }
+        }
+    }
+
     response_tx.close_channel();
     // Waiting for message_tx to be dropped before exiting
     while message_rx.next().await.is_some() {
         // Receiving messages after closing down. Ignore them.
     }
-    // eprintln!("<worker> exit");
     Ok(())
 }
 
@@ -656,6 +764,9 @@ impl WebsocketHandle {
     async fn new(builder: WebsocketBuilder<'_>) -> Result<WebsocketHandle> {
         let url = builder.as_url()?;
         let host = url.host_str().ok_or(DeepgramError::InvalidUrl)?;
+        let auth = builder.deepgram.auth.clone();
+        let reconnect_config = builder.reconnect.clone();
+        let keep_alive = builder.keep_alive.unwrap_or(false);
 
         let request = {
             let http_builder = Request::builder()
@@ -668,7 +779,7 @@ impl WebsocketHandle {
                 .header("sec-websocket-version", "13")
                 .header("user-agent", crate::USER_AGENT);
 
-            let builder = if let Some(auth) = &builder.deepgram.auth {
+            let builder = if let Some(auth) = &auth {
                 http_builder.header("authorization", auth.header_value())
             } else {
                 http_builder
@@ -697,11 +808,14 @@ impl WebsocketHandle {
         tokio::task::spawn({
             let message_tx = message_tx.clone();
             run_worker(
+                url,
+                auth,
+                reconnect_config,
                 ws_stream,
                 message_tx,
                 message_rx,
                 response_tx,
-                builder.keep_alive.unwrap_or(false),
+                keep_alive,
             )
         });
 

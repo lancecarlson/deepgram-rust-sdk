@@ -42,6 +42,7 @@ use crate::{
     common::{
         flux_response::FluxResponse,
         options::{Encoding, Options},
+        reconnect::ReconnectConfig,
     },
     Deepgram, DeepgramError, Result, Transcription,
 };
@@ -55,6 +56,7 @@ pub struct FluxBuilder<'a> {
     encoding: Option<Encoding>,
     sample_rate: Option<u32>,
     stream_url: Url,
+    reconnect: Option<ReconnectConfig>,
 }
 
 impl Transcription<'_> {
@@ -114,6 +116,7 @@ impl Transcription<'_> {
             encoding: None,
             sample_rate: None,
             stream_url: self.flux_url(),
+            reconnect: None,
         }
     }
 
@@ -154,6 +157,7 @@ impl FluxBuilder<'_> {
             encoding,
             sample_rate,
             stream_url,
+            reconnect: _,
         } = self;
 
         let mut url = stream_url.clone();
@@ -185,6 +189,16 @@ impl FluxBuilder<'_> {
 
     pub fn sample_rate(mut self, sample_rate: u32) -> Self {
         self.sample_rate = Some(sample_rate);
+        self
+    }
+
+    /// Enable automatic reconnection with the given configuration.
+    ///
+    /// When enabled, if the WebSocket connection drops unexpectedly,
+    /// the client will automatically attempt to reconnect with exponential backoff.
+    /// Messages sent during reconnection will be queued in the channel buffer.
+    pub fn reconnect(mut self, config: ReconnectConfig) -> Self {
+        self.reconnect = Some(config);
         self
     }
 }
@@ -305,6 +319,8 @@ pub struct FluxHandle {
 impl FluxHandle {
     async fn new(builder: FluxBuilder<'_>) -> Result<FluxHandle> {
         let url = builder.as_url()?;
+        let auth = builder.deepgram.auth.clone();
+        let reconnect_config = builder.reconnect.clone();
         let host = url.host_str().ok_or(DeepgramError::InvalidUrl)?;
 
         let request = {
@@ -318,7 +334,7 @@ impl FluxHandle {
                 .header("sec-websocket-version", "13")
                 .header("user-agent", crate::USER_AGENT);
 
-            let builder = if let Some(auth) = &builder.deepgram.auth {
+            let builder = if let Some(auth) = &auth {
                 http_builder.header("authorization", auth.header_value())
             } else {
                 http_builder
@@ -344,7 +360,14 @@ impl FluxHandle {
         let (message_tx, message_rx) = mpsc::channel(256);
         let (response_tx, response_rx) = mpsc::channel(256);
 
-        tokio::task::spawn(run_flux_worker(ws_stream, message_rx, response_tx));
+        tokio::task::spawn(run_flux_worker(
+            url,
+            auth,
+            reconnect_config,
+            ws_stream,
+            message_rx,
+            response_tx,
+        ));
 
         Ok(FluxHandle {
             message_tx,
@@ -384,16 +407,57 @@ impl FluxHandle {
     }
 }
 
-async fn run_flux_worker(
+/// Reason the inner worker loop exited.
+enum WorkerExit {
+    /// Normal close (user-initiated or server close with no error).
+    Closed,
+    /// Unexpected error (connection lost, etc.).
+    Error(DeepgramError),
+}
+
+/// Connect to the Flux WebSocket server and return the stream.
+async fn connect_flux_websocket(
+    url: &Url,
+    auth: &Option<crate::AuthMethod>,
+) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
+    let host = url.host_str().ok_or(DeepgramError::InvalidUrl)?;
+
+    let request = {
+        let http_builder = Request::builder()
+            .method("GET")
+            .uri(url.to_string())
+            .header("sec-websocket-key", client::generate_key())
+            .header("host", host)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("user-agent", crate::USER_AGENT);
+
+        let builder = if let Some(auth) = auth {
+            http_builder.header("authorization", auth.header_value())
+        } else {
+            http_builder
+        };
+        builder.body(())?
+    };
+
+    let (ws_stream, _upgrade_response) = tokio_tungstenite::connect_async(request).await?;
+    Ok(ws_stream)
+}
+
+/// Inner worker loop that processes a single Flux WebSocket connection.
+/// Returns a `WorkerExit` indicating whether the exit was clean or an error.
+async fn run_flux_worker_inner(
     ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    mut message_rx: Receiver<WsMessage>,
-    mut response_tx: Sender<Result<FluxResponse>>,
-) -> Result<()> {
+    message_rx: &mut Receiver<WsMessage>,
+    response_tx: &mut Sender<Result<FluxResponse>>,
+) -> WorkerExit {
     // We use Vec<u8> for partial frames because we don't know if a fragment of a string is valid utf-8.
     let mut partial_frame: Vec<u8> = Vec::new();
     let (mut ws_stream_send, ws_stream_recv) = ws_stream.split();
     let mut ws_stream_recv = ws_stream_recv.fuse();
     let mut is_open: bool = true;
+    let mut user_closed = false;
     loop {
         select_biased! {
             response = ws_stream_recv.next() => {
@@ -419,11 +483,15 @@ async fn run_flux_worker(
                         let _ = ws_stream_send.send(Message::Pong(value)).await;
                     }
                     Some(Ok(Message::Close(None))) => {
-                        return Ok(());
+                        return WorkerExit::Closed;
                     }
                     Some(Ok(Message::Close(Some(closeframe)))) => {
-                        return Err(DeepgramError::WebsocketClose {
-                            code: closeframe.code.into(),
+                        let code: u16 = closeframe.code.into();
+                        if code == 1000 {
+                            return WorkerExit::Closed;
+                        }
+                        return WorkerExit::Error(DeepgramError::WebsocketClose {
+                            code,
                             reason: closeframe.reason.to_string(),
                         });
                     }
@@ -457,14 +525,11 @@ async fn run_flux_worker(
                         // They can be safely ignored.
                     }
                     Some(Err(err)) => {
-                        if (response_tx.send(Err(err.into())).await).is_err() {
-                            // Responses are no longer being received; close the stream.
-                            break;
-                        }
+                        return WorkerExit::Error(err.into());
                     }
                     None => {
                         // Upstream is closed
-                        return Ok(())
+                        return WorkerExit::Closed;
                     }
                 }
             }
@@ -485,6 +550,7 @@ async fn run_flux_worker(
                                 let _ = response_tx.send(Err(err.into())).await;
                             }
                             is_open = false;
+                            user_closed = true;
                         }
                     }
                 }
@@ -492,17 +558,62 @@ async fn run_flux_worker(
         }
     }
     // Post-loop cleanup: ensure CloseStream is sent if connection is still open
-    if is_open {
+    if is_open && !user_closed {
         if let Err(err) = ws_stream_send
             .send(Message::Text(Utf8Bytes::from(
                 serde_json::to_string(&ControlMessage::CloseStream).unwrap_or_default(),
             )))
             .await
         {
-            // If the response channel is closed, there's nothing to be done about it now.
             let _ = response_tx.send(Err(err.into())).await;
         }
     }
+    WorkerExit::Closed
+}
+
+/// Run the Flux worker with optional reconnection support.
+async fn run_flux_worker(
+    url: Url,
+    auth: Option<crate::AuthMethod>,
+    reconnect_config: Option<ReconnectConfig>,
+    initial_ws_stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    mut message_rx: Receiver<WsMessage>,
+    mut response_tx: Sender<Result<FluxResponse>>,
+) -> Result<()> {
+    let mut attempt = 0u32;
+    let mut ws_stream = initial_ws_stream;
+
+    loop {
+        let exit_reason =
+            run_flux_worker_inner(ws_stream, &mut message_rx, &mut response_tx).await;
+
+        match exit_reason {
+            WorkerExit::Closed => break,
+            WorkerExit::Error(e) => {
+                if let Some(ref config) = reconnect_config {
+                    if config.should_retry(attempt) {
+                        let delay = config.delay_for_attempt(attempt);
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        match connect_flux_websocket(&url, &auth).await {
+                            Ok(new_stream) => {
+                                ws_stream = new_stream;
+                                continue;
+                            }
+                            Err(connect_err) => {
+                                let _ = response_tx.send(Err(connect_err)).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // No reconnect configured or max retries reached
+                let _ = response_tx.send(Err(e)).await;
+                break;
+            }
+        }
+    }
+
     response_tx.close_channel();
     // Waiting for message_tx to be dropped before exiting
     while message_rx.next().await.is_some() {
