@@ -5,4 +5,5 @@ pub mod batch_response;
 #[cfg(feature = "listen")]
 pub mod flux_response;
 pub mod options;
+pub mod reconnect;
 pub mod stream_response;
