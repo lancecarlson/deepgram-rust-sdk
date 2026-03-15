@@ -63,6 +63,24 @@ pub enum FluxResponse {
         description: String,
     },
 
+    /// Server confirms configuration was applied
+    ConfigureSuccess {
+        #[allow(missing_docs)]
+        request_id: Uuid,
+
+        #[allow(missing_docs)]
+        sequence_id: u32,
+    },
+
+    /// Server reports configuration failed
+    ConfigureFailure {
+        #[allow(missing_docs)]
+        request_id: Uuid,
+
+        #[allow(missing_docs)]
+        sequence_id: u32,
+    },
+
     /// An unknown message type received from the server.
     ///
     /// This variant is used for forward-compatibility when the server sends
@@ -96,6 +114,14 @@ enum TaggedFluxResponse {
         sequence_id: u32,
         code: String,
         description: String,
+    },
+    ConfigureSuccess {
+        request_id: Uuid,
+        sequence_id: u32,
+    },
+    ConfigureFailure {
+        request_id: Uuid,
+        sequence_id: u32,
     },
 }
 
@@ -139,6 +165,20 @@ impl From<TaggedFluxResponse> for FluxResponse {
                 code,
                 description,
             },
+            TaggedFluxResponse::ConfigureSuccess {
+                request_id,
+                sequence_id,
+            } => FluxResponse::ConfigureSuccess {
+                request_id,
+                sequence_id,
+            },
+            TaggedFluxResponse::ConfigureFailure {
+                request_id,
+                sequence_id,
+            } => FluxResponse::ConfigureFailure {
+                request_id,
+                sequence_id,
+            },
         }
     }
 }
@@ -153,7 +193,7 @@ impl<'de> Deserialize<'de> for FluxResponse {
         let type_str = value.get("type").and_then(|t| t.as_str());
 
         match type_str {
-            Some("Connected" | "TurnInfo" | "Error") => {
+            Some("Connected" | "TurnInfo" | "Error" | "ConfigureSuccess" | "ConfigureFailure") => {
                 serde_json::from_value::<TaggedFluxResponse>(value)
                     .map(FluxResponse::from)
                     .map_err(de::Error::custom)
@@ -212,6 +252,26 @@ impl Serialize for FluxResponse {
                     sequence_id: *sequence_id,
                     code: code.clone(),
                     description: description.clone(),
+                };
+                tagged.serialize(serializer)
+            }
+            FluxResponse::ConfigureSuccess {
+                request_id,
+                sequence_id,
+            } => {
+                let tagged = TaggedFluxResponse::ConfigureSuccess {
+                    request_id: *request_id,
+                    sequence_id: *sequence_id,
+                };
+                tagged.serialize(serializer)
+            }
+            FluxResponse::ConfigureFailure {
+                request_id,
+                sequence_id,
+            } => {
+                let tagged = TaggedFluxResponse::ConfigureFailure {
+                    request_id: *request_id,
+                    sequence_id: *sequence_id,
                 };
                 tagged.serialize(serializer)
             }
@@ -308,6 +368,60 @@ mod tests {
     #[test]
     fn serialize_roundtrip_connected() {
         let json = r#"{"type":"Connected","request_id":"550e8400-e29b-41d4-a716-446655440000","sequence_id":0}"#;
+        let response: FluxResponse = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn deserialize_configure_success() {
+        let json = r#"{"type": "ConfigureSuccess", "request_id": "550e8400-e29b-41d4-a716-446655440000", "sequence_id": 5}"#;
+        let response: FluxResponse = serde_json::from_str(json).unwrap();
+        match response {
+            FluxResponse::ConfigureSuccess {
+                request_id,
+                sequence_id,
+            } => {
+                assert_eq!(
+                    request_id,
+                    "550e8400-e29b-41d4-a716-446655440000".parse::<Uuid>().unwrap()
+                );
+                assert_eq!(sequence_id, 5);
+            }
+            _ => panic!("expected ConfigureSuccess variant"),
+        }
+    }
+
+    #[test]
+    fn deserialize_configure_failure() {
+        let json = r#"{"type": "ConfigureFailure", "request_id": "550e8400-e29b-41d4-a716-446655440000", "sequence_id": 3}"#;
+        let response: FluxResponse = serde_json::from_str(json).unwrap();
+        match response {
+            FluxResponse::ConfigureFailure {
+                request_id,
+                sequence_id,
+            } => {
+                assert_eq!(
+                    request_id,
+                    "550e8400-e29b-41d4-a716-446655440000".parse::<Uuid>().unwrap()
+                );
+                assert_eq!(sequence_id, 3);
+            }
+            _ => panic!("expected ConfigureFailure variant"),
+        }
+    }
+
+    #[test]
+    fn serialize_roundtrip_configure_success() {
+        let json = r#"{"type":"ConfigureSuccess","request_id":"550e8400-e29b-41d4-a716-446655440000","sequence_id":5}"#;
+        let response: FluxResponse = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&response).unwrap();
+        assert_eq!(serialized, json);
+    }
+
+    #[test]
+    fn serialize_roundtrip_configure_failure() {
+        let json = r#"{"type":"ConfigureFailure","request_id":"550e8400-e29b-41d4-a716-446655440000","sequence_id":3}"#;
         let response: FluxResponse = serde_json::from_str(json).unwrap();
         let serialized = serde_json::to_string(&response).unwrap();
         assert_eq!(serialized, json);
