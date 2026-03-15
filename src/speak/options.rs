@@ -50,6 +50,64 @@ pub enum Model {
     #[allow(missing_docs)]
     AuraZeusEn,
 
+    // Aura-2 English voices
+
+    #[allow(missing_docs)]
+    Aura2ThaliaEn,
+
+    #[allow(missing_docs)]
+    Aura2AndromedaEn,
+
+    #[allow(missing_docs)]
+    Aura2ArcasEn,
+
+    #[allow(missing_docs)]
+    Aura2AsteriaEn,
+
+    #[allow(missing_docs)]
+    Aura2AthenaEn,
+
+    #[allow(missing_docs)]
+    Aura2HeraEn,
+
+    #[allow(missing_docs)]
+    Aura2LunaEn,
+
+    #[allow(missing_docs)]
+    Aura2OrionEn,
+
+    #[allow(missing_docs)]
+    Aura2OrpheusEn,
+
+    #[allow(missing_docs)]
+    Aura2PerseusEn,
+
+    #[allow(missing_docs)]
+    Aura2StellaEn,
+
+    #[allow(missing_docs)]
+    Aura2HeliosEn,
+
+    #[allow(missing_docs)]
+    Aura2ZeusEn,
+
+    #[allow(missing_docs)]
+    Aura2AngusEn,
+
+    // Aura-2 Spanish voices
+
+    #[allow(missing_docs)]
+    Aura2SirioEs,
+
+    #[allow(missing_docs)]
+    Aura2HelenaEs,
+
+    #[allow(missing_docs)]
+    Aura2NestorEs,
+
+    #[allow(missing_docs)]
+    Aura2CarinaEs,
+
     #[allow(missing_docs)]
     CustomId(String),
 }
@@ -69,6 +127,24 @@ impl AsRef<str> for Model {
             Self::AuraOrpheusEn => "aura-orpheus-en",
             Self::AuraHeliosEn => "aura-helios-en",
             Self::AuraZeusEn => "aura-zeus-en",
+            Self::Aura2ThaliaEn => "aura-2-thalia-en",
+            Self::Aura2AndromedaEn => "aura-2-andromeda-en",
+            Self::Aura2ArcasEn => "aura-2-arcas-en",
+            Self::Aura2AsteriaEn => "aura-2-asteria-en",
+            Self::Aura2AthenaEn => "aura-2-athena-en",
+            Self::Aura2HeraEn => "aura-2-hera-en",
+            Self::Aura2LunaEn => "aura-2-luna-en",
+            Self::Aura2OrionEn => "aura-2-orion-en",
+            Self::Aura2OrpheusEn => "aura-2-orpheus-en",
+            Self::Aura2PerseusEn => "aura-2-perseus-en",
+            Self::Aura2StellaEn => "aura-2-stella-en",
+            Self::Aura2HeliosEn => "aura-2-helios-en",
+            Self::Aura2ZeusEn => "aura-2-zeus-en",
+            Self::Aura2AngusEn => "aura-2-angus-en",
+            Self::Aura2SirioEs => "aura-2-sirio-es",
+            Self::Aura2HelenaEs => "aura-2-helena-es",
+            Self::Aura2NestorEs => "aura-2-nestor-es",
+            Self::Aura2CarinaEs => "aura-2-carina-es",
             Self::CustomId(id) => id,
         }
     }
