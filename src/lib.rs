@@ -33,6 +33,8 @@ pub mod listen;
 pub mod manage;
 #[cfg(feature = "speak")]
 pub mod speak;
+#[cfg(feature = "listen")]
+pub mod agent;
 
 static DEEPGRAM_BASE_URL: &str = "https://api.deepgram.com";
 
@@ -63,6 +65,17 @@ pub struct Transcription<'a>(#[allow(unused)] pub &'a Deepgram);
 #[derive(Debug, Clone)]
 pub struct Speak<'a>(#[allow(unused)] pub &'a Deepgram);
 
+/// Deepgram Agent API client.
+///
+/// Constructed using [`Deepgram::agent`].
+///
+/// See the [Deepgram Agent API Reference][api] for more info.
+///
+/// [api]: https://developers.deepgram.com/docs/voicebot
+#[cfg(feature = "listen")]
+#[derive(Debug, Clone)]
+pub struct Agent<'a>(pub &'a Deepgram);
+
 impl Deepgram {
     /// Construct a new [`Transcription`] from a [`Deepgram`].
     pub fn transcription(&self) -> Transcription<'_> {
@@ -72,6 +85,12 @@ impl Deepgram {
     /// Construct a new [`Speak`] from a [`Deepgram`].
     pub fn text_to_speech(&self) -> Speak<'_> {
         self.into()
+    }
+
+    /// Access the Agent API.
+    #[cfg(feature = "listen")]
+    pub fn agent(&self) -> Agent<'_> {
+        Agent(self)
     }
 }
 
