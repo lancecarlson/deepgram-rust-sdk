@@ -26,6 +26,7 @@ use futures::{
 };
 use http::Request;
 use pin_project::pin_project;
+use serde::Serialize;
 use serde_urlencoded;
 use tokio::fs::File;
 use tokio_tungstenite::{tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream};
@@ -283,16 +284,37 @@ impl FluxBuilder<'_> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+/// Thresholds for configuring Flux turn detection mid-stream.
+#[derive(Debug, Clone, Serialize)]
+pub struct FluxConfigureThresholds {
+    /// Confidence threshold for eager end-of-turn detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eager_eot_threshold: Option<f64>,
+    /// Confidence threshold for end-of-turn detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eot_threshold: Option<f64>,
+    /// Timeout in milliseconds for end-of-turn detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eot_timeout_ms: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum ControlMessage {
     CloseStream,
+    Configure {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thresholds: Option<FluxConfigureThresholds>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        keyterms: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WsMessage {
     Audio(Vec<u8>),
     CloseStream,
+    Configure(String),
 }
 
 #[derive(Debug)]
@@ -356,6 +378,26 @@ impl FluxHandle {
     pub async fn send_data(&mut self, data: Vec<u8>) -> Result<()> {
         self.message_tx
             .send(WsMessage::Audio(data))
+            .await
+            .map_err(|err| DeepgramError::InternalClientError(err.into()))?;
+        Ok(())
+    }
+
+    /// Send a Configure message to dynamically update turn detection thresholds
+    /// and keyterms mid-stream.
+    pub async fn configure(
+        &mut self,
+        thresholds: Option<FluxConfigureThresholds>,
+        keyterms: Vec<String>,
+    ) -> Result<()> {
+        let msg = ControlMessage::Configure {
+            thresholds,
+            keyterms,
+        };
+        let json = serde_json::to_string(&msg)
+            .map_err(|e| DeepgramError::InternalClientError(e.into()))?;
+        self.message_tx
+            .send(WsMessage::Configure(json))
             .await
             .map_err(|err| DeepgramError::InternalClientError(err.into()))?;
         Ok(())
@@ -473,6 +515,15 @@ async fn run_flux_worker(
                     match message {
                         Some(WsMessage::Audio(audio)) => {
                             if let Err(err) = ws_stream_send.send(Message::Binary(Bytes::from(audio))).await {
+                                if response_tx.send(Err(err.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Some(WsMessage::Configure(json)) => {
+                            if let Err(err) = ws_stream_send.send(Message::Text(
+                                Utf8Bytes::from(json)
+                            )).await {
                                 if response_tx.send(Err(err.into())).await.is_err() {
                                     break;
                                 }
@@ -623,6 +674,73 @@ mod tests {
             dg.transcription().flux_url().to_string(),
             "ws://localhost:8080/v2/listen",
         );
+    }
+
+    #[test]
+    fn test_configure_serialization_with_thresholds_and_keyterms() {
+        use super::{ControlMessage, FluxConfigureThresholds};
+
+        let msg = ControlMessage::Configure {
+            thresholds: Some(FluxConfigureThresholds {
+                eager_eot_threshold: Some(0.8),
+                eot_threshold: Some(0.9),
+                eot_timeout_ms: Some(500),
+            }),
+            keyterms: vec!["hello".to_string(), "world".to_string()],
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "Configure");
+        assert_eq!(json["thresholds"]["eager_eot_threshold"], 0.8);
+        assert_eq!(json["thresholds"]["eot_threshold"], 0.9);
+        assert_eq!(json["thresholds"]["eot_timeout_ms"], 500);
+        assert_eq!(json["keyterms"], serde_json::json!(["hello", "world"]));
+    }
+
+    #[test]
+    fn test_configure_serialization_no_thresholds() {
+        use super::ControlMessage;
+
+        let msg = ControlMessage::Configure {
+            thresholds: None,
+            keyterms: vec!["test".to_string()],
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "Configure");
+        assert!(json.get("thresholds").is_none());
+        assert_eq!(json["keyterms"], serde_json::json!(["test"]));
+    }
+
+    #[test]
+    fn test_configure_serialization_empty_keyterms() {
+        use super::{ControlMessage, FluxConfigureThresholds};
+
+        let msg = ControlMessage::Configure {
+            thresholds: Some(FluxConfigureThresholds {
+                eager_eot_threshold: Some(0.5),
+                eot_threshold: None,
+                eot_timeout_ms: None,
+            }),
+            keyterms: vec![],
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "Configure");
+        assert_eq!(json["thresholds"]["eager_eot_threshold"], 0.5);
+        assert!(json.get("keyterms").is_none());
+    }
+
+    #[test]
+    fn test_flux_configure_thresholds_partial() {
+        use super::FluxConfigureThresholds;
+
+        let thresholds = FluxConfigureThresholds {
+            eager_eot_threshold: None,
+            eot_threshold: Some(0.7),
+            eot_timeout_ms: None,
+        };
+        let json = serde_json::to_value(&thresholds).unwrap();
+        assert!(json.get("eager_eot_threshold").is_none());
+        assert_eq!(json["eot_threshold"], 0.7);
+        assert!(json.get("eot_timeout_ms").is_none());
     }
 
     #[test]
